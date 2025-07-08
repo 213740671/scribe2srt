@@ -15,9 +15,9 @@ Scribe2SRT 是一款专业的音视频转字幕工具。通过集成 ElevenLabs 
 ## 💻 安装使用
 
 ### 快速开始
-1. 前往 [Releases 页面](https://github.com/your-username/scribe2srt/releases) 下载最新版本
+1. 前往 [Releases 页面](https://github.com/cylind/scribe2srt/releases) 下载最新版本
 2. 解压后直接运行程序
-3. **推荐安装 FFmpeg**：用于视频文件处理，提升处理效率
+3. **推荐安装 FFmpeg**：用于视频文件处理，提升兼容性和处理效率
 
 <details>
 <summary>从源码运行（点击展开）</summary>
