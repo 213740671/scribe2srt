@@ -9,6 +9,7 @@
 from typing import Dict, List, Tuple
 import re
 from .config import MIN_SUBTITLE_DURATION, MIN_SUBTITLE_GAP, CPS_SETTINGS, CPL_SETTINGS
+from .punctuation_handler import PunctuationHandler
 
 
 class IntelligentMerger:
@@ -79,27 +80,13 @@ class IntelligentMerger:
                 break
             else:
                 # 寻找合适的分割点
-                split_pos = self._find_line_split_position(remaining_text)
+                split_pos = PunctuationHandler.find_split_position(remaining_text, self.max_chars_per_line)
                 lines.append(remaining_text[:split_pos].strip())
                 remaining_text = remaining_text[split_pos:].strip()
         
         return len(lines)
     
-    def _find_line_split_position(self, text: str) -> int:
-        """寻找行内分割位置"""
-        if len(text) <= self.max_chars_per_line:
-            return len(text)
-        
-        # 优先在标点符号处分割
-        split_chars = "。？！、，；： .,;:!?()-" if self.is_cjk else " .,;:!?()-"
-        
-        # 从最大长度向前搜索分割点
-        for i in range(min(self.max_chars_per_line, len(text)), 0, -1):
-            if text[i-1] in split_chars:
-                return i
-        
-        # 如果没找到合适的分割点，强制在最大长度处分割
-        return min(self.max_chars_per_line, len(text))
+
     
     def _can_merge_entries(self, entry1: Dict, entry2: Dict) -> Tuple[bool, str]:
         """

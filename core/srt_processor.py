@@ -14,6 +14,7 @@ from .config import (
 )
 from .sentence_splitter import SentenceSplitter
 from .intelligent_merger import IntelligentMerger
+from .punctuation_handler import PunctuationHandler
 
 
 def format_srt_time(seconds: float) -> str:
@@ -278,7 +279,7 @@ class SrtProcessor:
             return text
 
         # Find the best split position for the first line
-        split_pos = self._find_best_split_position(text, self.max_chars_per_line)
+        split_pos = PunctuationHandler.find_split_position(text, self.max_chars_per_line)
 
         first_line = text[:split_pos].strip()
         remaining_text = text[split_pos:].strip()
@@ -290,46 +291,7 @@ class SrtProcessor:
             # If remaining text is too long, return as-is to preserve content
             return f"{first_line}\n{remaining_text}"
 
-    def _find_best_split_position(self, text: str, max_length: int) -> int:
-        """
-        Find the best position to split text following semantic rules.
-        Prioritizes linguistic sense over visual aesthetics (Netflix standard).
-        """
-        if len(text) <= max_length:
-            return len(text)
 
-        split_chars = self._get_split_characters()
-
-        # Search for the best split position within the allowed range
-        best_pos = -1
-        search_end = min(max_length + 1, len(text))
-
-        # Try to find split characters in reverse order (prefer later positions)
-        for i in range(search_end - 1, 0, -1):
-            if text[i] in split_chars:
-                # For spaces, split before the space
-                if text[i] == ' ':
-                    best_pos = i
-                    break
-                # For punctuation, split after the punctuation
-                else:
-                    best_pos = i + 1
-                    break
-
-        # If no good split point found, force split at max_length
-        if best_pos <= 0:
-            best_pos = max_length
-
-        return best_pos
-
-    def _get_split_characters(self) -> str:
-        """Get appropriate split characters based on language."""
-        if self.is_cjk:
-            # CJK languages: prioritize punctuation marks
-            return "。？！、，；：""''（）《》「」 "
-        else:
-            # Latin languages: prioritize spaces and common punctuation
-            return " .,;:!?()\"'-"
 
 
 def create_srt_from_json(json_data: Dict, max_subtitle_duration: float = None,

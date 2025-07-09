@@ -7,6 +7,7 @@
 """
 
 from typing import Dict, List, Tuple
+from .punctuation_handler import PunctuationHandler
 
 
 class SentenceSplitter:
@@ -23,21 +24,8 @@ class SentenceSplitter:
     def __init__(self, language_code: str = "eng"):
         self.language = language_code[:3]
         self.is_cjk = self._is_cjk_language()
-        
-        # 定义标点符号优先级 - 扩展支持常见ASR标点符号
-        if self.is_cjk:
-            self.high_priority_punct = ["。", "！", "？"]  # 句子结束符
-            self.medium_priority_punct = ["；", "：", "》", "」", "】", "）"]  # 子句结束符，包含引用结束符
-            self.low_priority_punct = ["，", "、", "《", "「", "【", "（", "…", "...", "-"]  # 短语分隔符，包含引用开始符、省略号和连字符
-        else:
-            self.high_priority_punct = [".", "!", "?"]    # 句子结束符
-            self.medium_priority_punct = [";", ":", ")", "]", "}"]  # 子句结束符，包含闭合符号
-            self.low_priority_punct = [",", "(", "[", "{", "...", "…", "-"]  # 短语分隔符，包含开放符号、省略号和连字符
-        
-        # 所有分割标点符号
-        self.all_split_punct = (self.high_priority_punct +
-                               self.medium_priority_punct +
-                               self.low_priority_punct)
+
+
     
     def _is_cjk_language(self) -> bool:
         """检查是否为CJK语言"""
@@ -45,47 +33,20 @@ class SentenceSplitter:
     
 
     
-    def _get_punctuation_priority(self, punct: str) -> int:
-        """
-        获取标点符号的优先级
-        
-        Args:
-            punct: 标点符号
-            
-        Returns:
-            优先级 (0=高, 1=中, 2=低, -1=不是分割标点)
-        """
-        if punct in self.high_priority_punct:
-            return 0
-        elif punct in self.medium_priority_punct:
-            return 1
-        elif punct in self.low_priority_punct:
-            return 2
-        else:
-            return -1
+
     
     def _word_ends_with_split_punct(self, word_info: Dict) -> Tuple[bool, str, int]:
         """
         检查单词是否以分割标点符号结尾
-        
+
         Args:
             word_info: 单词信息字典
-            
+
         Returns:
             (是否以分割标点结尾, 标点符号, 优先级)
         """
         text = word_info.get('text', '').strip()
-        if not text:
-            return False, "", -1
-        
-        # 检查最后一个字符
-        last_char = text[-1]
-        priority = self._get_punctuation_priority(last_char)
-        
-        if priority >= 0:
-            return True, last_char, priority
-        
-        return False, "", -1
+        return PunctuationHandler.word_ends_with_punctuation(text)
     
     def _should_split_at_word(self, word_info: Dict, accumulated_words: List[Dict]) -> bool:
         """
