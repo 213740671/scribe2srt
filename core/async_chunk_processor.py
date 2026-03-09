@@ -8,7 +8,7 @@
 import os
 import json
 import time
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Protocol, cast
 from PySide6.QtCore import (
     QObject,
     Signal,
@@ -18,7 +18,24 @@ from PySide6.QtCore import (
     QRunnable,
 )
 
-from api.client import ElevenLabsSTTClient
+from api.client import (
+    APIKeyManager,
+    ElevenLabsSTTClient,
+    TranscriptJson,
+    TranscriptWord,
+)
+
+
+class AsyncProcessorParentLike(Protocol):
+    semaphore: QSemaphore
+    mutex: QMutex
+    processing_chunks: set[int]
+
+    def _wait_for_rate_limit(self) -> None: ...
+
+    def is_cancelled_requested(self) -> bool: ...
+
+    def emit_log(self, message: str) -> None: ...
 
 
 class ChunkProcessorSignals(QObject):
@@ -39,8 +56,8 @@ class ChunkProcessorTask(QRunnable):
         tag_audio_events: bool,
         ffmpeg_available: bool,
         max_retries: int,
-        parent_processor,
-        api_key_manager=None,
+        parent_processor: AsyncProcessorParentLike,
+        api_key_manager: Optional[APIKeyManager] = None,
     ):
         super().__init__()
         self.signals = ChunkProcessorSignals()
@@ -82,10 +99,20 @@ class ChunkProcessorTask(QRunnable):
                 log_handler=self.parent_processor.emit_log,
             )
 
-            words = transcript_json.get("words", [])
+            raw_words = transcript_json.get("words", [])
+            words: list[TranscriptWord] = []
+            if isinstance(raw_words, list):
+                typed_raw_words = cast(list[object], raw_words)
+                for raw_word in typed_raw_words:
+                    if isinstance(raw_word, dict):
+                        words.append(cast(TranscriptWord, raw_word))
             for word in words:
-                word["start"] = round(word["start"] + self.time_offset, 3)
-                word["end"] = round(word["end"] + self.time_offset, 3)
+                start = word.get("start")
+                end = word.get("end")
+                if isinstance(start, (int, float)):
+                    word["start"] = round(start + self.time_offset, 3)
+                if isinstance(end, (int, float)):
+                    word["end"] = round(end + self.time_offset, 3)
 
             self._save_chunk_json(transcript_json)
             self.signals.chunk_completed.emit(self.chunk_index, transcript_json)
@@ -98,7 +125,7 @@ class ChunkProcessorTask(QRunnable):
 
             self.parent_processor.semaphore.release()
 
-    def _save_chunk_json(self, transcript_json: dict):
+    def _save_chunk_json(self, transcript_json: TranscriptJson) -> None:
         try:
             base_chunk_path, _ = os.path.splitext(self.chunk_path)
             segment_json_path = base_chunk_path + ".json"
@@ -119,16 +146,19 @@ class AsyncChunkProcessor(QObject):
     progress_updated = Signal(int, int, int)
 
     def __init__(
-        self, max_concurrent_chunks: int = 3, max_retries: int = 3, api_key_manager=None
+        self,
+        max_concurrent_chunks: int = 3,
+        max_retries: int = 3,
+        api_key_manager: Optional[APIKeyManager] = None,
     ):
         super().__init__()
         self.max_concurrent_chunks = max_concurrent_chunks
         self.max_retries = max_retries
         self.api_key_manager = api_key_manager
 
-        self.completed_chunks: Dict[int, dict] = {}
+        self.completed_chunks: Dict[int, TranscriptJson] = {}
         self.failed_chunks: Dict[int, str] = {}
-        self.processing_chunks: set = set()
+        self.processing_chunks: set[int] = set()
         self.total_chunks = 0
         self.is_cancelled = False
 
@@ -202,11 +232,11 @@ class AsyncChunkProcessor(QObject):
                 # 连接信号
                 processor.signals.chunk_completed.connect(self._on_chunk_completed)
                 processor.signals.chunk_failed.connect(self._on_chunk_failed)
-                processor.signals.progress_updated.connect(
-                    lambda sent, total, chunk_idx=i: self.progress_updated.emit(
-                        chunk_idx, sent, total
-                    )
-                )
+
+                def forward_progress(sent: int, total: int, chunk_idx: int = i) -> None:
+                    self.progress_updated.emit(chunk_idx, sent, total)
+
+                processor.signals.progress_updated.connect(forward_progress)
 
                 # 启动任务
                 from PySide6.QtCore import QThreadPool
@@ -231,7 +261,7 @@ class AsyncChunkProcessor(QObject):
         with QMutexLocker(self.mutex):
             return self.is_cancelled
 
-    def _wait_for_rate_limit(self):
+    def _wait_for_rate_limit(self) -> None:
         while True:
             with QMutexLocker(self.mutex):
                 now = time.monotonic()
@@ -249,7 +279,9 @@ class AsyncChunkProcessor(QObject):
 
             time.sleep(min(0.1, wait_time if wait_time > 0 else 0.1))
 
-    def _on_chunk_completed(self, chunk_index: int, transcript_json: dict):
+    def _on_chunk_completed(
+        self, chunk_index: int, transcript_json: TranscriptJson
+    ) -> None:
         with QMutexLocker(self.mutex):
             self.completed_chunks[chunk_index] = transcript_json
             total_processed = len(self.completed_chunks) + len(self.failed_chunks)
@@ -281,7 +313,7 @@ class AsyncChunkProcessor(QObject):
         if should_finalize:
             self.processing_failed.emit(f"以下片段处理失败: {failed_list}")
 
-    def _merge_transcripts(self) -> dict:
+    def _merge_transcripts(self) -> TranscriptJson:
         """按顺序合并所有转录结果，保持完整的JSON结构
 
         注意：每个片段的时间偏移已经在ChunkTask.run()中应用过了，
@@ -292,12 +324,16 @@ class AsyncChunkProcessor(QObject):
 
         # 获取第一个片段作为模板，保留完整的元数据结构
         first_chunk_index = min(self.completed_chunks.keys())
-        combined_transcript = self.completed_chunks[first_chunk_index].copy()
+        combined_transcript: TranscriptJson = self.completed_chunks[
+            first_chunk_index
+        ].copy()
 
         # 确保有words和text字段
-        if "words" not in combined_transcript:
+        words_field = combined_transcript.get("words")
+        if not isinstance(words_field, list):
             combined_transcript["words"] = []
-        if "text" not in combined_transcript:
+        text_field = combined_transcript.get("text")
+        if not isinstance(text_field, str):
             combined_transcript["text"] = ""
 
         # 按片段索引顺序合并（时间偏移已经在各个片段中处理过了）
@@ -309,15 +345,35 @@ class AsyncChunkProcessor(QObject):
             transcript = self.completed_chunks[i]
 
             # 直接追加words（时间偏移已经在ChunkTask中处理）
-            words = transcript.get("words", [])
-            combined_transcript["words"].extend(words)
+            raw_words = transcript.get("words", [])
+            words: list[TranscriptWord] = []
+            if isinstance(raw_words, list):
+                typed_raw_words = cast(list[object], raw_words)
+                for raw_word in typed_raw_words:
+                    if isinstance(raw_word, dict):
+                        words.append(cast(TranscriptWord, raw_word))
+            existing_words = combined_transcript.get("words")
+
+            normalized_existing_words: list[TranscriptWord] = []
+            if isinstance(existing_words, list):
+                typed_existing_words = cast(list[object], existing_words)
+                for existing_word in typed_existing_words:
+                    if isinstance(existing_word, dict):
+                        normalized_existing_words.append(
+                            cast(TranscriptWord, existing_word)
+                        )
+            combined_transcript["words"] = normalized_existing_words
+            normalized_existing_words.extend(words)
 
             # 拼接文本
             text = transcript.get("text", "")
-            if text:
-                if combined_transcript["text"]:
-                    combined_transcript["text"] += " "
-                combined_transcript["text"] += text
+            if isinstance(text, str) and text:
+                existing_text = combined_transcript.get("text")
+                if not isinstance(existing_text, str):
+                    existing_text = ""
+                if existing_text:
+                    existing_text += " "
+                combined_transcript["text"] = existing_text + text
 
         return combined_transcript
 

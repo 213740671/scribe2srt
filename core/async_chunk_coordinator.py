@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Optional
 
+from api.client import APIKeyManager, TranscriptJson
 from .async_chunk_processor import AsyncChunkProcessor
 
 
@@ -11,7 +12,7 @@ class AsyncChunkCoordinator:
         *,
         max_concurrent_chunks: int,
         max_retries: int,
-        api_key_manager,
+        api_key_manager: Optional[APIKeyManager],
         api_rate_limit_per_minute: int,
         logger: Callable[[str], None],
     ):
@@ -26,13 +27,13 @@ class AsyncChunkCoordinator:
     def connect(
         self,
         *,
-        chunk_started,
-        chunk_completed,
-        chunk_failed,
-        all_completed,
-        processing_failed,
-        progress_updated,
-    ):
+        chunk_started: Callable[[int], None],
+        chunk_completed: Callable[[int, TranscriptJson], None],
+        chunk_failed: Callable[[int, str], None],
+        all_completed: Callable[[TranscriptJson], None],
+        processing_failed: Callable[[str], None],
+        progress_updated: Callable[[int, int, int], None],
+    ) -> None:
         self.processor.chunk_started.connect(chunk_started)
         self.processor.chunk_completed.connect(chunk_completed)
         self.processor.chunk_failed.connect(chunk_failed)

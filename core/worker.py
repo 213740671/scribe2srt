@@ -7,16 +7,21 @@
 import os
 import sys
 import subprocess
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any, Callable
 
 from PySide6.QtCore import QObject, Signal, QThreadPool
 
-from api.client import ElevenLabsSTTClient, APIKeyManager
+from api.client import APIKeyManager, ElevenLabsSTTClient, TranscriptJson
 from .config import CODEC_EXTENSION_MAP, DEFAULT_AUDIO_EXTENSION
-from .async_chunk_processor import AsyncChunkProcessor
 from .worker_state import WorkerState
 from .async_chunk_coordinator import AsyncChunkCoordinator
 from .transcript_persistence import TranscriptPersistenceHelper
+
+
+ChunkStartedCallback = Callable[[int], None]
+ChunkCompletedCallback = Callable[[int, TranscriptJson], None]
+AllCompletedCallback = Callable[[TranscriptJson], None]
+ProgressUpdatedCallback = Callable[[int, int, int], None]
 
 
 class Worker(QObject):
@@ -106,7 +111,7 @@ class Worker(QObject):
         self.persistence = TranscriptPersistenceHelper(self.log_message.emit)
         self._initialize_processing_state()
 
-    def _initialize_processing_state(self):
+    def _initialize_processing_state(self) -> None:
         if self.restore_state:
             self.temp_chunks = list(self.restore_state.temp_chunks)
             self.owned_temp_chunks = list(self.restore_state.owned_temp_chunks)
@@ -367,14 +372,14 @@ class Worker(QObject):
         self,
         *,
         chunk_paths: List[str],
-        chunk_started,
-        chunk_completed,
-        all_completed,
-        progress_updated,
+        chunk_started: ChunkStartedCallback,
+        chunk_completed: ChunkCompletedCallback,
+        all_completed: AllCompletedCallback,
+        progress_updated: ProgressUpdatedCallback,
         start_status: str,
         start_message: str,
         failure_message: str,
-    ):
+    ) -> None:
         self.log_message.emit("-" * 20)
         self.log_message.emit(start_message)
         self.chunk_progress.emit(-1, start_status, start_message)
@@ -401,7 +406,7 @@ class Worker(QObject):
         if not success:
             self.error.emit(failure_message)
 
-    def _process_chunks_async(self):
+    def _process_chunks_async(self) -> None:
         """异步处理所有音频片段"""
         self._start_async_processing(
             chunk_paths=self.temp_chunks,
@@ -414,7 +419,7 @@ class Worker(QObject):
             failure_message="启动异步处理失败",
         )
 
-    def _process_chunks_sequential(self):
+    def _process_chunks_sequential(self) -> None:
         """顺序处理音频片段（原有逻辑）"""
         if self.current_chunk_index < self.total_chunks:
             self.time_offset = self.current_chunk_index * self.split_duration_sec
@@ -434,7 +439,7 @@ class Worker(QObject):
         else:
             self._finalize_task()
 
-    def _process_restored_chunks(self):
+    def _process_restored_chunks(self) -> None:
         """处理恢复的任务"""
         # 计算剩余需要处理的片段
         remaining_chunks = self.temp_chunks[self.current_chunk_index :]
@@ -468,7 +473,7 @@ class Worker(QObject):
             failure_message="恢复模式：启动异步处理失败",
         )
 
-    def _process_single_file(self, file_path: str):
+    def _process_single_file(self, file_path: str) -> None:
         """为单个文件准备并开始上传任务。"""
         self.uploader = self.client.prepare_upload_task(
             file_path, self.language_code, self.tag_audio_events
@@ -632,9 +637,7 @@ class Worker(QObject):
         )
         # transcript_json 在这里不需要特殊处理，由异步处理器自动合并
 
-    def _on_async_all_completed_restored(
-        self, remaining_transcript: dict[str, Any]
-    ):
+    def _on_async_all_completed_restored(self, remaining_transcript: dict[str, Any]):
         """恢复模式：所有剩余异步片段完成回调"""
         self.log_message.emit("恢复模式：所有剩余片段异步处理完成，正在合并结果...")
 
@@ -653,7 +656,7 @@ class Worker(QObject):
         self.progress_updated.emit(bytes_sent, total_bytes)
         # chunk_index 用于标识片段，但在恢复模式下不需要特殊处理
 
-    def on_upload_finished(self, transcript_json):
+    def on_upload_finished(self, transcript_json: TranscriptJson) -> None:
         """当一个片段上传和转录成功时调用。"""
         self.log_message.emit(
             f"片段 {self.current_chunk_index + 1}/{self.total_chunks} 转录成功。"
@@ -762,7 +765,7 @@ class Worker(QObject):
         # 用户取消时强制清理临时文件
         self._cleanup_chunks(force_cleanup=True)
 
-    def _cleanup_chunks(self, force_cleanup=False):
+    def _cleanup_chunks(self, force_cleanup: bool = False) -> None:
         """清理所有临时的音频片段文件。
 
         Args:

@@ -1,7 +1,7 @@
 import os
 import time
 import threading
-from typing import Optional, Any, Dict, Tuple, List, Callable
+from typing import Optional, Any, Dict, Tuple, List, Callable, BinaryIO, cast, Protocol
 
 import requests
 from requests_toolbelt.multipart.encoder import (
@@ -53,6 +53,22 @@ RETRYABLE_EXCEPTIONS = (
     requests.exceptions.ChunkedEncodingError,
 )
 
+TranscriptWord = dict[str, Any]
+TranscriptJson = dict[str, Any]
+RequestPayload = dict[str, Any]
+RequestHeaders = dict[str, str]
+RequestParams = dict[str, str]
+LogHandler = Callable[[str], None]
+CancelChecker = Callable[[], bool]
+ProgressHandler = Callable[[int, int], None]
+FileField = tuple[str, BinaryIO | None, str]
+
+
+class UploadMonitorLike(Protocol):
+    bytes_read: int
+    len: int
+    content_type: str
+
 
 def is_retryable_error(error: Exception) -> bool:
     """判断错误是否可重试"""
@@ -60,6 +76,30 @@ def is_retryable_error(error: Exception) -> bool:
         status_code = error.response.status_code
         return status_code in [429, 502, 503, 504]
     return isinstance(error, RETRYABLE_EXCEPTIONS)
+
+
+def _extract_file_field(payload: RequestPayload) -> FileField:
+    file_field = payload.get("file")
+    if not isinstance(file_field, tuple):
+        raise RuntimeError("上传载荷中的文件字段格式无效。")
+
+    typed_file_field = cast(tuple[object, ...], file_field)
+    if len(typed_file_field) != 3:
+        raise RuntimeError("上传载荷中的文件字段格式无效。")
+
+    file_name_obj = typed_file_field[0]
+    file_obj_obj = typed_file_field[1]
+    mime_type_obj = typed_file_field[2]
+
+    if not isinstance(file_name_obj, str) or not isinstance(mime_type_obj, str):
+        raise RuntimeError("上传载荷中的文件字段类型无效。")
+    if file_obj_obj is not None and not hasattr(file_obj_obj, "read"):
+        raise RuntimeError("上传载荷中的文件对象无效。")
+
+    file_name = file_name_obj
+    file_obj = cast(BinaryIO | None, file_obj_obj)
+    mime_type = mime_type_obj
+    return (file_name, file_obj, mime_type)
 
 
 def classify_error(error: Exception) -> Tuple[str, str, bool, bool]:
@@ -309,11 +349,11 @@ class APIKeyManager:
 
 
 def create_retry_session(
-    retries=MAX_RETRIES,
-    backoff_factor=1.5,
-    status_forcelist=(500, 502, 503, 504),
-    allowed_methods=("HEAD", "GET", "POST"),
-):
+    retries: int = MAX_RETRIES,
+    backoff_factor: float = 1.5,
+    status_forcelist: tuple[int, ...] = (500, 502, 503, 504),
+    allowed_methods: tuple[str, ...] = ("HEAD", "GET", "POST"),
+) -> requests.Session:
     """创建一个带自动重试机制的 requests Session"""
     session = requests.Session()
 
@@ -348,9 +388,9 @@ class Uploader(QRunnable):
     def __init__(
         self,
         file_path: str,
-        payload: Dict,
-        headers: Dict,
-        params: Optional[Dict] = None,
+        payload: RequestPayload,
+        headers: RequestHeaders,
+        params: Optional[RequestParams] = None,
         max_retries: int = MAX_RETRIES,
         api_key_manager: Optional[APIKeyManager] = None,
     ):
@@ -365,47 +405,60 @@ class Uploader(QRunnable):
         self._is_cancelled = False
         self.api_key_manager = api_key_manager
 
-    def _is_operation_cancelled(self, cancel_checker=None) -> bool:
+    def _is_operation_cancelled(
+        self, cancel_checker: Optional[CancelChecker] = None
+    ) -> bool:
         if self._is_cancelled:
             return True
         return bool(cancel_checker and cancel_checker())
 
-    def _emit_log(self, message: str, log_handler=None):
+    def _emit_log(self, message: str, log_handler: Optional[LogHandler] = None) -> None:
         if log_handler:
             log_handler(message)
         else:
             self.signals.log_message.emit(message)
 
-    def _sleep_with_cancellation(self, delay: float, cancel_checker=None):
+    def _sleep_with_cancellation(
+        self, delay: float, cancel_checker: Optional[CancelChecker] = None
+    ) -> None:
         deadline = time.monotonic() + delay
         while time.monotonic() < deadline:
             if self._is_operation_cancelled(cancel_checker):
                 raise RuntimeError("任务被用户取消。")
             time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
-    def _perform_upload(self, progress_handler=None, cancel_checker=None):
+    def _perform_upload(
+        self,
+        progress_handler: Optional[ProgressHandler] = None,
+        cancel_checker: Optional[CancelChecker] = None,
+    ) -> TranscriptJson:
         if self._is_operation_cancelled(cancel_checker):
             raise RuntimeError("任务被用户取消。")
 
         with open(self.file_path, "rb") as f_audio:
+            _, _, mime_type = _extract_file_field(self.payload)
             self.payload["file"] = (
                 os.path.basename(self.file_path),
                 f_audio,
-                self.payload["file"][2],
+                mime_type,
             )
 
-            def on_progress(monitor):
+            def on_progress(monitor: MultipartEncoderMonitor) -> None:
+                monitor_info = cast(UploadMonitorLike, monitor)
                 if self._is_operation_cancelled(cancel_checker):
                     raise IOError("Upload cancelled by user.")
+                bytes_read = int(monitor_info.bytes_read)
+                total_bytes = int(monitor_info.len)
                 if progress_handler:
-                    progress_handler(monitor.bytes_read, monitor.len)
+                    progress_handler(bytes_read, total_bytes)
                 else:
-                    self.signals.progress.emit(monitor.bytes_read, monitor.len)
+                    self.signals.progress.emit(bytes_read, total_bytes)
 
             encoder = MultipartEncoder(fields=self.payload)
             monitor = MultipartEncoderMonitor(encoder, on_progress)
+            monitor_info = cast(UploadMonitorLike, monitor)
             headers = self.headers.copy()
-            headers["Content-Type"] = monitor.content_type
+            headers["Content-Type"] = monitor_info.content_type
 
             response = self.session.post(
                 ELEVENLABS_STT_API_URL,
@@ -418,8 +471,11 @@ class Uploader(QRunnable):
             return response.json()
 
     def _upload_with_retries(
-        self, progress_handler=None, cancel_checker=None, log_handler=None
-    ):
+        self,
+        progress_handler: Optional[ProgressHandler] = None,
+        cancel_checker: Optional[CancelChecker] = None,
+        log_handler: Optional[LogHandler] = None,
+    ) -> TranscriptJson:
         key_switch_count = 0
 
         while True:
@@ -481,8 +537,11 @@ class Uploader(QRunnable):
                 raise RuntimeError("上传失败，未能完成请求。")
 
     def execute_sync(
-        self, progress_handler=None, cancel_checker=None, log_handler=None
-    ):
+        self,
+        progress_handler: Optional[ProgressHandler] = None,
+        cancel_checker: Optional[CancelChecker] = None,
+        log_handler: Optional[LogHandler] = None,
+    ) -> TranscriptJson:
         try:
             return self._upload_with_retries(
                 progress_handler, cancel_checker, log_handler
@@ -503,10 +562,11 @@ class Uploader(QRunnable):
                 error_title, error_hint, _, _ = classify_error(e)
                 self.signals.error.emit(f"{error_title}: {error_hint}")
 
-    def progress_callback(self, monitor):
+    def progress_callback(self, monitor: MultipartEncoderMonitor) -> None:
+        monitor_info = cast(UploadMonitorLike, monitor)
         if self._is_cancelled:
             raise IOError("Upload cancelled by user.")
-        self.signals.progress.emit(monitor.bytes_read, monitor.len)
+        self.signals.progress.emit(int(monitor_info.bytes_read), int(monitor_info.len))
 
     def cancel(self):
         self._is_cancelled = True
@@ -572,7 +632,7 @@ class ElevenLabsSTTClient:
                 else f"video/{ext.replace('.', '')}"
             )
 
-        payload = {
+        payload: RequestPayload = {
             "model_id": DEFAULT_STT_MODEL_ID,
             "diarize": "true",
             "tag_audio_events": str(tag_audio_events).lower(),
