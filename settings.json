@@ -11,5 +11,6 @@
     "max_concurrent_chunks": 3,
     "max_retries": 3,
     "api_rate_limit_per_minute": 30,
-    "pause_threshold": 0.7
+    "pause_threshold": 0.7,
+    "elevenlabs_api_key": ""
 }

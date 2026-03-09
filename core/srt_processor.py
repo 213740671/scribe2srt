@@ -6,8 +6,9 @@ SRT字幕处理器模块
 使用新的两阶段算法：基于标点符号的句子预分割 + 智能合并
 """
 
-import datetime
-from typing import Dict, List, Tuple
+from typing import Any, List, Optional
+
+WORD_LEVEL_MIN_DURATION = 0.001
 
 from .config import (
     MIN_SUBTITLE_DURATION, MIN_SUBTITLE_GAP, CPS_SETTINGS, CPL_SETTINGS
@@ -19,11 +20,16 @@ from .punctuation_handler import PunctuationHandler
 
 def format_srt_time(seconds: float) -> str:
     """Convert seconds to SRT time format (HH:MM:SS,mmm)."""
-    td = datetime.timedelta(seconds=seconds)
-    hours, remainder = divmod(td.total_seconds(), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    milliseconds = int((seconds % 1) * 1000)
-    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d},{milliseconds:03d}"
+    total_ms = max(0, int(round(seconds * 1000)))
+    hours = total_ms // 3_600_000
+    minutes = (total_ms % 3_600_000) // 60_000
+    secs = (total_ms % 60_000) // 1_000
+    milliseconds = total_ms % 1_000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
+
+
+JsonDict = dict[str, Any]
+SubtitleEntry = dict[str, Any]
 
 
 class SrtProcessor:
@@ -37,8 +43,12 @@ class SrtProcessor:
     - 多语言支持和专业标准遵循
     """
     
-    def __init__(self, json_data: Dict, max_subtitle_duration: float = None,
-                 subtitle_settings: Dict = None):
+    def __init__(
+        self,
+        json_data: JsonDict,
+        max_subtitle_duration: Optional[float] = None,
+        subtitle_settings: Optional[JsonDict] = None,
+    ):
         self.srt_content = []
         self.line_number = 1
         self.language = json_data.get("language_code", "eng")[:3] # e.g., "eng"
@@ -111,7 +121,7 @@ class SrtProcessor:
         else:
             return base_cps
 
-    def _preprocess_words(self, json_data: Dict):
+    def _preprocess_words(self, json_data: JsonDict):
         """
         Pre-processes the word list to handle language-specific quirks,
         such as merging standalone CJK punctuation and filtering out spacing characters.
@@ -147,7 +157,7 @@ class SrtProcessor:
                     continue
             self.words.append(word_info)
 
-    def _create_audio_event_entries(self) -> List[Dict]:
+    def _create_audio_event_entries(self) -> list[SubtitleEntry]:
         """
         为音频事件创建独立的字幕条目
 
@@ -217,7 +227,7 @@ class SrtProcessor:
         # Stage 5: Generate final SRT content with optimized display formatting
         return self._generate_final_srt_content(all_entries)
 
-    def _generate_final_srt_content(self, entries: List[Dict]) -> str:
+    def _generate_final_srt_content(self, entries: list[SubtitleEntry]) -> str:
         """
         Generate final SRT content with optimized display formatting
         
@@ -294,8 +304,11 @@ class SrtProcessor:
 
 
 
-def create_srt_from_json(json_data: Dict, max_subtitle_duration: float = None,
-                        subtitle_settings: Dict = None) -> str:
+def create_srt_from_json(
+    json_data: JsonDict,
+    max_subtitle_duration: Optional[float] = None,
+    subtitle_settings: Optional[JsonDict] = None,
+) -> str:
     """
     Processes transcription JSON data to create a professional SRT file.
 
@@ -309,3 +322,47 @@ def create_srt_from_json(json_data: Dict, max_subtitle_duration: float = None,
     """
     processor = SrtProcessor(json_data, max_subtitle_duration, subtitle_settings)
     return processor.create_srt()
+
+
+def _iter_word_level_entries(json_data: JsonDict) -> list[tuple[float, float, str]]:
+    entries: list[tuple[float, float, str]] = []
+
+    for word_info in json_data.get("words", []):
+        if word_info.get("type") != "word":
+            continue
+
+        text = str(word_info.get("text", "")).strip()
+        if not text:
+            continue
+
+        start = word_info.get("start")
+        end = word_info.get("end")
+        if start is None or end is None:
+            continue
+
+        try:
+            start_sec = max(0.0, float(start))
+            end_sec = max(0.0, float(end))
+        except (TypeError, ValueError):
+            continue
+
+        if end_sec <= start_sec:
+            end_sec = start_sec + WORD_LEVEL_MIN_DURATION
+
+        entries.append((start_sec, end_sec, text))
+
+    return entries
+
+
+def create_word_level_srt_from_json(json_data: JsonDict) -> str:
+    entries = _iter_word_level_entries(json_data)
+    if not entries:
+        return ""
+
+    srt_lines: List[str] = []
+    for index, (start_sec, end_sec, text) in enumerate(entries, 1):
+        srt_lines.append(
+            f"{index}\n{format_srt_time(start_sec)} --> {format_srt_time(end_sec)}\n{text}\n"
+        )
+
+    return "\n".join(srt_lines)

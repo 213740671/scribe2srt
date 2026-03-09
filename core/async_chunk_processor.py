@@ -9,24 +9,39 @@ import os
 import json
 import time
 from typing import List, Dict, Any, Optional, Callable
-from PySide6.QtCore import QObject, Signal, QMutex, QMutexLocker, QSemaphore, QRunnable, QEventLoop, QTimer
+from PySide6.QtCore import (
+    QObject,
+    Signal,
+    QMutex,
+    QMutexLocker,
+    QSemaphore,
+    QRunnable,
+)
 
 from api.client import ElevenLabsSTTClient
 
 
 class ChunkProcessorSignals(QObject):
     """片段处理任务的信号"""
+
     chunk_completed = Signal(int, dict)  # chunk_index, transcript_json
     chunk_failed = Signal(int, str)  # chunk_index, error_message
     progress_updated = Signal(int, int)  # bytes_sent, total_bytes
 
 
 class ChunkProcessorTask(QRunnable):
-    """单个音频片段处理任务"""
-
-    def __init__(self, chunk_index: int, chunk_path: str, time_offset: float,
-                 language_code: str, tag_audio_events: bool, ffmpeg_available: bool,
-                 max_retries: int, parent_processor):
+    def __init__(
+        self,
+        chunk_index: int,
+        chunk_path: str,
+        time_offset: float,
+        language_code: str,
+        tag_audio_events: bool,
+        ffmpeg_available: bool,
+        max_retries: int,
+        parent_processor,
+        api_key_manager=None,
+    ):
         super().__init__()
         self.signals = ChunkProcessorSignals()
         self.chunk_index = chunk_index
@@ -37,167 +52,102 @@ class ChunkProcessorTask(QRunnable):
         self.ffmpeg_available = ffmpeg_available
         self.max_retries = max_retries
         self.parent_processor = parent_processor
+        self.api_key_manager = api_key_manager
 
     def run(self):
-        """执行片段处理"""
         try:
-            # 获取信号量（限制并发数）
             self.parent_processor.semaphore.acquire()
-
-            # 速率限制检查
             self.parent_processor._wait_for_rate_limit()
 
-            if self.parent_processor.is_cancelled:
-                raise Exception("任务被取消")
+            if self.parent_processor.is_cancelled_requested():
+                raise RuntimeError("任务被取消")
 
-            # 标记开始处理
             with QMutexLocker(self.parent_processor.mutex):
                 self.parent_processor.processing_chunks.add(self.chunk_index)
 
-            # 创建API客户端
-            client = ElevenLabsSTTClient(ffmpeg_available=self.ffmpeg_available)
+            client = ElevenLabsSTTClient(
+                ffmpeg_available=self.ffmpeg_available,
+                api_key_manager=self.api_key_manager,
+            )
+            uploader = client.prepare_upload_task(
+                self.chunk_path, self.language_code, self.tag_audio_events
+            )
 
-            # 重试机制
-            last_error = None
-            for attempt in range(self.max_retries):
-                if self.parent_processor.is_cancelled:
-                    raise Exception("任务被取消")
+            if not uploader:
+                raise RuntimeError(f"无法为片段 {self.chunk_index} 准备上传任务")
 
-                try:
-                    # 准备上传任务
-                    uploader = client.prepare_upload_task(
-                        self.chunk_path, self.language_code, self.tag_audio_events
-                    )
+            transcript_json = uploader.execute_sync(
+                progress_handler=self.signals.progress_updated.emit,
+                cancel_checker=self.parent_processor.is_cancelled_requested,
+                log_handler=self.parent_processor.emit_log,
+            )
 
-                    if not uploader:
-                        raise Exception(f"无法为片段 {self.chunk_index} 准备上传任务")
+            words = transcript_json.get("words", [])
+            for word in words:
+                word["start"] = round(word["start"] + self.time_offset, 3)
+                word["end"] = round(word["end"] + self.time_offset, 3)
 
-                    # 连接进度信号
-                    uploader.signals.progress.connect(self.signals.progress_updated)
-
-                    # 执行上传（同步等待）
-                    transcript_json = self._execute_upload_sync(uploader)
-
-                    # 调整时间偏移
-                    words = transcript_json.get("words", [])
-                    for word in words:
-                        word["start"] = round(word["start"] + self.time_offset, 3)
-                        word["end"] = round(word["end"] + self.time_offset, 3)
-
-                    # 保存分段JSON文件
-                    self._save_chunk_json(transcript_json)
-
-                    # 发送完成信号
-                    self.signals.chunk_completed.emit(self.chunk_index, transcript_json)
-                    return
-
-                except Exception as e:
-                    last_error = e
-                    if attempt < self.max_retries - 1:
-                        wait_time = 2 ** attempt  # 指数退避
-                        time.sleep(wait_time)
-
-            # 所有重试都失败
-            raise last_error or Exception("未知错误")
+            self._save_chunk_json(transcript_json)
+            self.signals.chunk_completed.emit(self.chunk_index, transcript_json)
 
         except Exception as e:
             self.signals.chunk_failed.emit(self.chunk_index, str(e))
         finally:
-            # 清理状态
             with QMutexLocker(self.parent_processor.mutex):
                 self.parent_processor.processing_chunks.discard(self.chunk_index)
 
             self.parent_processor.semaphore.release()
 
-    def _execute_upload_sync(self, uploader) -> dict:
-        """同步执行上传任务"""
-
-        result = {}
-        error = {}
-        loop = QEventLoop()
-
-        def on_finished(transcript_json):
-            result['data'] = transcript_json
-            loop.quit()
-
-        def on_error(error_message):
-            error['message'] = error_message
-            loop.quit()
-
-        # 连接信号
-        uploader.signals.finished.connect(on_finished)
-        uploader.signals.error.connect(on_error)
-
-        # 设置超时定时器
-        timeout_timer = QTimer()
-        timeout_timer.setSingleShot(True)
-        timeout_timer.timeout.connect(loop.quit)
-        timeout_timer.start(1800000)  # 30分钟超时
-
-        # 启动上传
-        from PySide6.QtCore import QThreadPool
-        QThreadPool.globalInstance().start(uploader)
-
-        # 等待完成
-        loop.exec()
-
-        timeout_timer.stop()
-
-        if 'data' in result:
-            return result['data']
-        elif 'message' in error:
-            raise Exception(error['message'])
-        else:
-            raise Exception("上传超时或被取消")
-
     def _save_chunk_json(self, transcript_json: dict):
-        """保存分段JSON文件"""
         try:
             base_chunk_path, _ = os.path.splitext(self.chunk_path)
             segment_json_path = base_chunk_path + ".json"
-            with open(segment_json_path, 'w', encoding='utf-8') as f:
+            with open(segment_json_path, "w", encoding="utf-8") as f:
                 json.dump(transcript_json, f, ensure_ascii=False, indent=4)
-        except Exception:
-            pass  # 忽略保存错误
+        except OSError as e:
+            self.parent_processor.emit_log(
+                f"警告：保存片段 {self.chunk_index + 1} 的JSON文件失败: {e}"
+            )
 
 
 class AsyncChunkProcessor(QObject):
-    """异步音频片段处理器"""
+    chunk_started = Signal(int)
+    chunk_completed = Signal(int, dict)
+    chunk_failed = Signal(int, str)
+    all_chunks_completed = Signal(dict)
+    processing_failed = Signal(str)
+    progress_updated = Signal(int, int, int)
 
-    # 信号定义
-    chunk_started = Signal(int)  # chunk_index
-    chunk_completed = Signal(int, dict)  # chunk_index, transcript_json
-    chunk_failed = Signal(int, str)  # chunk_index, error_message
-    all_chunks_completed = Signal(dict)  # combined_transcript
-    processing_failed = Signal(str)  # error_message
-    progress_updated = Signal(int, int, int)  # chunk_index, bytes_sent, total_bytes
-
-    def __init__(self, max_concurrent_chunks: int = 3, max_retries: int = 3):
+    def __init__(
+        self, max_concurrent_chunks: int = 3, max_retries: int = 3, api_key_manager=None
+    ):
         super().__init__()
         self.max_concurrent_chunks = max_concurrent_chunks
         self.max_retries = max_retries
+        self.api_key_manager = api_key_manager
 
-        # 状态管理
         self.completed_chunks: Dict[int, dict] = {}
         self.failed_chunks: Dict[int, str] = {}
         self.processing_chunks: set = set()
         self.total_chunks = 0
         self.is_cancelled = False
 
-        # 线程安全
         self.mutex = QMutex()
         self.semaphore = QSemaphore(max_concurrent_chunks)
 
-        # 速率限制
         self.request_times: List[float] = []
         self.max_requests_per_minute = 30
+        self.log_callback: Optional[Callable[[str], None]] = None
 
-    def process_chunks_async(self, chunk_paths: List[str],
-                           split_duration_sec: float,
-                           language_code: str,
-                           tag_audio_events: bool,
-                           ffmpeg_available: bool,
-                           log_callback: Optional[Callable[[str], None]] = None) -> bool:
+    def process_chunks_async(
+        self,
+        chunk_paths: List[str],
+        split_duration_sec: float,
+        language_code: str,
+        tag_audio_events: bool,
+        ffmpeg_available: bool,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> bool:
         """
         异步处理所有音频片段
 
@@ -220,15 +170,13 @@ class AsyncChunkProcessor(QObject):
         self.failed_chunks.clear()
         self.processing_chunks.clear()
         self.is_cancelled = False
+        self.log_callback = log_callback
 
         if log_callback:
             log_callback(f"开始异步处理 {self.total_chunks} 个音频片段...")
 
         # 预计算时间偏移
-        time_offsets = {
-            i: i * split_duration_sec
-            for i in range(self.total_chunks)
-        }
+        time_offsets = {i: i * split_duration_sec for i in range(self.total_chunks)}
 
         # 使用Qt的线程池而不是Python的ThreadPoolExecutor
         # 这样可以更好地与Qt信号系统集成
@@ -247,19 +195,22 @@ class AsyncChunkProcessor(QObject):
                     tag_audio_events=tag_audio_events,
                     ffmpeg_available=ffmpeg_available,
                     max_retries=self.max_retries,
-                    parent_processor=self
+                    parent_processor=self,
+                    api_key_manager=self.api_key_manager,
                 )
 
                 # 连接信号
                 processor.signals.chunk_completed.connect(self._on_chunk_completed)
                 processor.signals.chunk_failed.connect(self._on_chunk_failed)
                 processor.signals.progress_updated.connect(
-                    lambda sent, total, chunk_idx=i:
-                    self.progress_updated.emit(chunk_idx, sent, total)
+                    lambda sent, total, chunk_idx=i: self.progress_updated.emit(
+                        chunk_idx, sent, total
+                    )
                 )
 
                 # 启动任务
                 from PySide6.QtCore import QThreadPool
+
                 QThreadPool.globalInstance().start(processor)
 
                 # 发送开始信号
@@ -272,60 +223,63 @@ class AsyncChunkProcessor(QObject):
                 log_callback(f"启动异步处理失败: {e}")
             return False
 
+    def emit_log(self, message: str):
+        if self.log_callback:
+            self.log_callback(message)
 
+    def is_cancelled_requested(self) -> bool:
+        with QMutexLocker(self.mutex):
+            return self.is_cancelled
 
     def _wait_for_rate_limit(self):
-        """等待速率限制"""
-        with QMutexLocker(self.mutex):
-            now = time.time()
+        while True:
+            with QMutexLocker(self.mutex):
+                now = time.monotonic()
+                self.request_times = [t for t in self.request_times if now - t < 60]
 
-            # 清理超过1分钟的请求记录
-            self.request_times = [
-                t for t in self.request_times
-                if now - t < 60
-            ]
+                if len(self.request_times) < self.max_requests_per_minute:
+                    self.request_times.append(now)
+                    return
 
-            # 检查是否需要等待
-            if len(self.request_times) >= self.max_requests_per_minute:
                 oldest_request = min(self.request_times)
-                wait_time = 60 - (now - oldest_request)
-                if wait_time > 0:
-                    time.sleep(wait_time)
+                wait_time = max(0.0, 60 - (now - oldest_request))
 
-            # 记录新请求
-            self.request_times.append(now)
+            if self.is_cancelled_requested():
+                raise RuntimeError("任务被取消")
+
+            time.sleep(min(0.1, wait_time if wait_time > 0 else 0.1))
 
     def _on_chunk_completed(self, chunk_index: int, transcript_json: dict):
-        """片段完成回调"""
         with QMutexLocker(self.mutex):
             self.completed_chunks[chunk_index] = transcript_json
-            self.chunk_completed.emit(chunk_index, transcript_json)
-
-            # 检查是否所有片段都完成
             total_processed = len(self.completed_chunks) + len(self.failed_chunks)
-            if total_processed == self.total_chunks:
-                if not self.failed_chunks:
-                    # 所有片段都成功，合并结果
-                    combined = self._merge_transcripts()
-                    self.all_chunks_completed.emit(combined)
-                else:
-                    # 有失败的片段
-                    failed_list = list(self.failed_chunks.keys())
-                    error_msg = f"以下片段处理失败: {failed_list}"
-                    self.processing_failed.emit(error_msg)
+            has_failures = bool(self.failed_chunks)
+            should_finalize = total_processed == self.total_chunks
+
+        self.chunk_completed.emit(chunk_index, transcript_json)
+
+        if not should_finalize:
+            return
+
+        if has_failures:
+            failed_list = sorted(self.failed_chunks.keys())
+            self.processing_failed.emit(f"以下片段处理失败: {failed_list}")
+            return
+
+        combined = self._merge_transcripts()
+        self.all_chunks_completed.emit(combined)
 
     def _on_chunk_failed(self, chunk_index: int, error_message: str):
-        """片段失败回调"""
         with QMutexLocker(self.mutex):
             self.failed_chunks[chunk_index] = error_message
-            self.chunk_failed.emit(chunk_index, error_message)
-
-            # 检查是否所有片段都完成
             total_processed = len(self.completed_chunks) + len(self.failed_chunks)
-            if total_processed == self.total_chunks:
-                failed_list = list(self.failed_chunks.keys())
-                error_msg = f"以下片段处理失败: {failed_list}"
-                self.processing_failed.emit(error_msg)
+            should_finalize = total_processed == self.total_chunks
+            failed_list = sorted(self.failed_chunks.keys())
+
+        self.chunk_failed.emit(chunk_index, error_message)
+
+        if should_finalize:
+            self.processing_failed.emit(f"以下片段处理失败: {failed_list}")
 
     def _merge_transcripts(self) -> dict:
         """按顺序合并所有转录结果，保持完整的JSON结构
@@ -382,5 +336,5 @@ class AsyncChunkProcessor(QObject):
                 "completed_chunks": len(self.completed_chunks),
                 "failed_chunks": len(self.failed_chunks),
                 "processing_chunks": len(self.processing_chunks),
-                "is_cancelled": self.is_cancelled
+                "is_cancelled": self.is_cancelled,
             }

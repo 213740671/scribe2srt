@@ -124,3 +124,14 @@ dmypy.json
 # IDE-specific files
 .vscode/
 .idea/
+
+# Local tool caches / workspace metadata
+.ruff_cache/
+.sisyphus/
+
+# Local AI workspace knowledge files
+AGENTS.md
+**/AGENTS.md
+
+# Windows reserved-name accidents
+nul

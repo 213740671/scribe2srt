@@ -1,0 +1,35 @@
+[tool.pyright]
+include = ["app.py", "api", "core", "ui", "tests"]
+exclude = ["**/__pycache__", "build", "dist", "sample"]
+extraPaths = ["F:/MyScripts/scribe2srt-main"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingImports = "none"
+reportMissingTypeStubs = "none"
+reportUnusedImport = "warning"
+reportDeprecated = "warning"
+reportUnknownVariableType = "warning"
+reportUnknownMemberType = "warning"
+reportUnknownArgumentType = "warning"
+reportUnknownParameterType = "warning"
+reportMissingParameterType = "warning"
+reportUnknownLambdaType = "warning"
+reportGeneralTypeIssues = "warning"
+
+[tool.basedpyright]
+include = ["app.py", "api", "core", "ui", "tests"]
+exclude = ["**/__pycache__", "build", "dist", "sample"]
+extraPaths = ["F:/MyScripts/scribe2srt-main"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingImports = "none"
+reportMissingTypeStubs = "none"
+reportUnusedImport = "warning"
+reportDeprecated = "warning"
+reportUnknownVariableType = "warning"
+reportUnknownMemberType = "warning"
+reportUnknownArgumentType = "warning"
+reportUnknownParameterType = "warning"
+reportMissingParameterType = "warning"
+reportUnknownLambdaType = "warning"
+reportGeneralTypeIssues = "warning"
